@@ -1,0 +1,15 @@
+data/lnb.h.i
+data/dvb/net.h.i
+data/dvb/dmx.h.i
+data/dvb/audio.h.i
+data/szap-s2.c.i
+data/dvb/version.h.i
+data/lnb.c.i
+data/dvb/ca.h.i
+data/README.i
+data/dvb/frontend.h.i
+data/.hgignore.i
+data/.hgtags.i
+data/dvb/osd.h.i
+data/dvb/video.h.i
+data/Makefile.i

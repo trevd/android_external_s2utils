@@ -1,0 +1,12 @@
+szap-s2 and scan-s2 for Android
+================================
+
+	
+These tools appear to date back to the early days of DVB-S2 in linux.
+They are quite little weigh and don't depend on external libraries 
+like libdvbv5
+
+You might find this repo useful if you want to understand the structure 
+of the DVB-S MPEG Transport and Packet Elementry Streams.
+
+scan-s2 Requires iconv .. Enjoy
