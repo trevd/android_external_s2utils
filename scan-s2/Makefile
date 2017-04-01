@@ -12,7 +12,7 @@ TARGET=scan-s2
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-	$(CC) $(CFLG) $(OBJ)  -liconv -o $(TARGET) $(CLIB)
+	$(CC) $(CFLG) $(OBJ)  -liconv_hook -o $(TARGET) $(CLIB)
 
 $(OBJ): $(HED)
 

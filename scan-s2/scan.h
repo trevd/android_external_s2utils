@@ -9,7 +9,7 @@
 #include <linux/dvb/dmx.h>
 
 #include "list.h"
-
+#define SYS_DVBC_ANNEX_AC SYS_DVBC_ANNEX_A
 #define FALSE	0
 #define TRUE	1
 
@@ -36,6 +36,12 @@ extern int verbosity;
 
 #if DVB_API_VERSION < 5 || DVB_API_VERSION_MINOR < 2
 #error scan-s2 requires Linux DVB driver API version 5.2 and newer!
+#endif
+
+#if __ANDROID__
+#define DVB_ADAPTER_FORMAT "/dev/dvb%d."
+#else
+#define DVB_ADAPTER_FORMAT "/dev/dvb/adapter%d/"
 #endif
 
 #ifndef DTV_STREAM_ID

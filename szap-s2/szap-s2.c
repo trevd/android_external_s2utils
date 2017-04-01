@@ -55,7 +55,7 @@
 #endif
 
 /* location of channel list file */
-#define CHANNEL_FILE "channels.conf"
+
 
 /* one line of the szap channel file has the following format:
  * ^name:frequency_MHz:polarization:sat_no:symbolrate:vpid:apid:service_id$
@@ -63,10 +63,18 @@
  * ^name:frequency_MHz:polarization[coderate][delivery][modulation][rolloff]:sat_no:symbolrate:vpid:apid:?:?:service_id:?:?:?$
  */
 
-
+#ifdef __ANDROID__
+#define CHANNEL_FILE "/system/etc/channels.conf"
 #define FRONTENDDEVICE "/dev/dvb%d.frontend%d"
 #define DEMUXDEVICE "/dev/dvb%d.demux%d"
 #define AUDIODEVICE "/dev/dvb%d.audio%d"
+#else
+#define CHANNEL_FILE "channels.conf"
+#define FRONTENDDEVICE "/dev/dvb/adapter%d/frontend%d"
+#define DEMUXDEVICE "/dev/dvb/adapter%d/demux%d"
+#define AUDIODEVICE "/dev/dvb/adapter%d/audio%d"
+
+#endif
 
 struct t_channel_parameter_map {
   int user_value;
@@ -221,14 +229,38 @@ static int set_demux(int dmxfd, int pid, int pes_type, int dvr)
 		return TRUE;
 
 	if (dvr) {
+			
 		int buffersize = 64 * 1024;
+		fprintf(stderr, "Setting DMX_SET_BUFFER_SIZE %d\n", buffersize);
 		if (ioctl(dmxfd, DMX_SET_BUFFER_SIZE, buffersize) == -1)
 			perror("DMX_SET_BUFFER_SIZE failed");
 	}
-
+	
+	fprintf(stderr, "Setting DMX_SET_PES_FILTER pid=%d ", pid );
+	switch (pes_type) {
+		case DMX_PES_AUDIO:
+			fprintf(stderr," type=DMX_PES_AUDIO\n");
+			break;
+		case DMX_PES_VIDEO:
+			fprintf(stderr," type=DMX_PES_VIDEO\n");
+			break;
+		case DMX_PES_PCR:
+			fprintf(stderr," type=DMX_PES_PCR\n");
+			break;
+		case DMX_PES_TELETEXT:
+			fprintf(stderr," type=DMX_PES_TELETEXT\n");
+			break;
+		case DMX_PES_OTHER:
+			fprintf(stderr," type=DMX_PES_OTHER\n");
+			break;
+		default:
+			fprintf(stderr," type=%d\n", pes_type);
+			break;
+	}
+	
 	pesfilter.pid = pid;
 	pesfilter.input = DMX_IN_FRONTEND;
-	pesfilter.output = dvr ? DMX_OUT_TS_TAP : DMX_OUT_DECODER;
+	pesfilter.output = DMX_OUT_TS_TAP ; ///: DMX_OUT_DECODER;
 	pesfilter.pes_type = pes_type;
 	pesfilter.flags = DMX_IMMEDIATE_START;
 
@@ -244,6 +276,7 @@ static int set_demux(int dmxfd, int pid, int pes_type, int dvr)
 
 int get_pmt_pid(char *dmxdev, int sid)
 {
+	fprintf(stderr, "get_pmt_pid=%d ", sid );
 	int patfd, count;
 	int pmt_pid = 0;
 	int patread = 0;
@@ -428,8 +461,8 @@ int check_frontend (int fe_fd, int dvr, int human_readable, int params_debug,
 			uncorrected_blocks = -2;
 
 		if (human_readable) {
-			printf ("status %02x | signal %3u%% | snr %3u%% | ber %d | unc %d | ",
-				status, (signal * 100) / 0xffff, (snr * 100) / 0xffff, ber, uncorrected_blocks);
+			printf ("status %02x | signal %3u%% | snr %3u%% %d | ber %d | unc %d | ",
+				status, (signal * 100) / 0xffff, (snr * 100) / 0xffff, snr, ber, uncorrected_blocks);
 		} else {
 			printf ("status %02x | signal %04x | snr %04x | ber %08x | unc %08x | ",
 				status, signal, snr, ber, uncorrected_blocks);
@@ -502,7 +535,7 @@ int zap_to(unsigned int adapter, unsigned int frontend, unsigned int demux,
 	};
 
 	char fedev[128], dmxdev[128], auddev[128];
-	static int fefd, dmxfda, dmxfdv, dmxfdt = -1, audiofd = -1, patfd, pmtfd;
+	static int fefd, dmxfda, dmxfdv, dmxpcr, dmxfdt = -1, audiofd = -1, patfd, pmtfd;
 	int pmtpid;
 	uint32_t ifreq;
 	int hiband, result;
@@ -535,11 +568,17 @@ int zap_to(unsigned int adapter, unsigned int frontend, unsigned int demux,
 			close(fefd);
 			return FALSE;
 		}
+		if ((dmxpcr = open(dmxdev, O_RDWR)) < 0) {
+			perror("opening teletext demux failed");
+			close(fefd);
+			return FALSE;
+		}
 
 		if (dvr == 0)	/* DMX_OUT_DECODER */
 			audiofd = open(auddev, O_RDWR);
 
 		if (rec_psi){
+			fprintf(stderr, "Opening Demux for pat reading\n");
 			if ((patfd = open(dmxdev, O_RDWR)) < 0) {
 				perror("opening pat demux failed");
 				close(audiofd);
@@ -589,9 +628,13 @@ int zap_to(unsigned int adapter, unsigned int frontend, unsigned int demux,
 			if (set_demux(dmxfdv, vpid, DMX_PES_VIDEO, dvr))
 				if (audiofd >= 0)
 					(void)ioctl(audiofd, AUDIO_SET_BYPASS_MODE, bypass);
+		if (!set_demux(dmxpcr, vpid, DMX_PES_PCR, dvr)) {
+			fprintf(stderr,"set_demux DMX_PES_PCR failed\n");
+		}
 	if (set_demux(dmxfda, apid, DMX_PES_AUDIO, dvr)) {
 		if (rec_psi) {
 			pmtpid = get_pmt_pid(dmxdev, sid);
+			set_demux(patfd, sid, DMX_PES_OTHER, dvr);
 			if (pmtpid < 0) {
 				result = FALSE;
 			}
@@ -654,7 +697,7 @@ static int read_channels(const char *filename, int list_channels,
 	FILE *cfp;
 	char buf[4096];
 	char inp[256];
-	char *field, *tmp, *p;
+	char *field, *tmp, *p, *endptr;
 	unsigned int line;
 	unsigned int freq, pol, sat_no, sr, vpid, apid, tpid, sid;
 	int ret;
@@ -673,19 +716,23 @@ again:
 			printf("\n");
 			return -1;
 		}
-		if (inp[0] == '-' && inp[1] == 'n') {
-			chan_no = strtoul(inp+2, NULL, 0);
-			chan_name = NULL;
-			if (!chan_no) {
-				fprintf(stderr, "bad channel number\n");
-				goto again;
-			}
+		if(strnlen(inp,sizeof(inp)) == 1) {
+			list_channels = 1;
 		} else {
-			p = strchr(inp, '\n');
-			if (p)
-			*p = '\0';
-			chan_name = inp;
-			chan_no = 0;
+			chan_no = strtoul(inp+2, &endptr, 0);
+			if(*endptr != NULL) {
+				chan_name = NULL;
+				if (!chan_no) {
+					fprintf(stderr, "bad channel number\n");
+					goto again;
+				}
+			} else {
+				p = strchr(inp, '\n');
+				if (p)
+				*p = '\0';
+				chan_name = inp;
+				chan_no = 0;
+			} 
 		}
 	}
 
@@ -721,8 +768,10 @@ again:
 			goto syntax_err;
 
 		while (field && *field) {
+			printf("field %d '%s':\n", line, field);
 			switch (toupper(*field)) {
 			case 'C':
+			
 				if (fec == -1)
 					field = parse_parameter(field, &fec, coderate_values);
 				else
@@ -908,9 +957,10 @@ syntax_err:
 	if (!interactive)
 		return FALSE;
 	}
-	if (interactive)
+	if (interactive) {
+		list_channels =0;
 		goto again;
-
+	}
 	return TRUE;
 }
 
@@ -945,7 +995,7 @@ bad_usage(char *pname, int prlnb)
 int main(int argc, char *argv[])
 {
 	const char *home;
-	char chanfile[2 * PATH_MAX];
+	char chanfile[2 * PATH_MAX] = CHANNEL_FILE;
 	int list_channels = 0;
 	unsigned int chan_no = 0;
 	const char *chan_name = NULL;
@@ -1061,11 +1111,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "error: $HOME not set\n");
 		return TRUE;
 	}
-	snprintf(chanfile, sizeof(chanfile),
-		"%s/.szap/%i/%s", home, adapter, CHANNEL_FILE);
-	if (access(chanfile, R_OK))
-		snprintf(chanfile, sizeof(chanfile),
-			 "%s/.szap/%s", home, CHANNEL_FILE);
+	
 	}
 
 	printf("reading channels from file '%s'\n", chanfile);

@@ -1,3 +1,5 @@
+#ifndef DVB_LNB_H_
+#define DVB_LNB_H_
 
 struct lnb_types_st {
 	char	*name;
@@ -22,3 +24,4 @@ lnb_enum(int curno);
 int
 lnb_decode(char *str, struct lnb_types_st *lnbp);
 
+#endif

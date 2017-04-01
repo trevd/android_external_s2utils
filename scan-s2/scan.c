@@ -43,6 +43,7 @@
 #include "dump-vdr.h"
 #include "scan.h"
 #include "lnb.h"
+#include <linux/dvb/frontend.h>
 
 #include "atsc_psip_section.h"
 
@@ -178,6 +179,25 @@ static void add_filter (struct section_buf *s);
 
 static const char * fe_type2str(fe_type_t t);
 
+static int get_ifreq (int freq)
+{
+	int hiband = 0;
+	int ifreq = 0;
+	if (lnb_type.switch_val && lnb_type.high_val &&
+		freq >= lnb_type.switch_val)
+		hiband = 1;
+
+	if (hiband)
+		ifreq = freq - lnb_type.high_val;
+	else {
+		if (freq < lnb_type.low_val)
+			ifreq = lnb_type.low_val - freq;
+	else
+		ifreq = freq - lnb_type.low_val;
+	}
+	return ifreq;
+}
+
 /* According to the DVB standards, the combination of network_id and
 * transport_stream_id should be unique, but in real life the satellite
 * operators and broadcasters don't care enough to coordinate
@@ -188,6 +208,7 @@ static const char * fe_type2str(fe_type_t t);
 */
 static struct transponder *alloc_transponder(uint32_t frequency)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	struct transponder *tp = calloc(1, sizeof(*tp));
 
 	memset(tp, 0, sizeof(*tp));
@@ -198,6 +219,117 @@ static struct transponder *alloc_transponder(uint32_t frequency)
 	INIT_LIST_HEAD(&tp->services);
 	list_add_tail(&tp->list, &new_transponders);
 	return tp;
+}
+
+
+static int do_tune(int fefd, unsigned int ifreq, unsigned int sr, enum fe_delivery_system delsys,
+		   int modulation, int fec, int rolloff)
+{
+	struct dvb_frontend_event ev;
+	struct dtv_property p[] = {
+		{ .cmd = DTV_DELIVERY_SYSTEM,	.u.data = delsys },
+		{ .cmd = DTV_FREQUENCY,		.u.data = ifreq },
+		{ .cmd = DTV_MODULATION,	.u.data = modulation },
+		{ .cmd = DTV_SYMBOL_RATE,	.u.data = sr },
+		{ .cmd = DTV_INNER_FEC,		.u.data = fec },
+		{ .cmd = DTV_INVERSION,		.u.data = INVERSION_AUTO },
+		{ .cmd = DTV_ROLLOFF,		.u.data = rolloff },
+		{ .cmd = DTV_PILOT,		.u.data = PILOT_AUTO },
+		{ .cmd = DTV_TUNE },
+	};
+	struct dtv_properties cmdseq = {
+		.num = 9,
+		.props = p
+	};
+
+	/* discard stale QPSK events */
+	while (1) {
+		if (ioctl(fefd, FE_GET_EVENT, &ev) == -1)
+		break;
+	}
+
+	if ((delsys != SYS_DVBS) && (delsys != SYS_DVBS2))
+		return -EINVAL;
+
+	if ((ioctl(fefd, FE_SET_PROPERTY, &cmdseq)) == -1) {
+		perror("FE_SET_PROPERTY failed");
+		return FALSE;
+	}
+	fprintf(stderr,"do_tune done\n");
+	return TRUE;
+}
+
+
+static
+int check_frontend (int fe_fd)
+{
+	
+	fe_status_t status;
+	uint16_t snr, signal;
+	uint32_t ber, uncorrected_blocks;
+	int timeout = 0;
+	char *field;
+	struct dtv_property p[] = {
+		{ .cmd = DTV_DELIVERY_SYSTEM },
+		{ .cmd = DTV_MODULATION },
+		{ .cmd = DTV_INNER_FEC },
+		{ .cmd = DTV_ROLLOFF },
+		{ .cmd = DTV_FREQUENCY },
+		{ .cmd = DTV_SYMBOL_RATE },
+	};
+	struct dtv_properties cmdseq = {
+		.num = 6,
+		.props = p
+	};
+
+	do {
+		if (ioctl(fe_fd, FE_READ_STATUS, &status) == -1)
+			perror("FE_READ_STATUS failed");
+		/* some frontends might not support all these ioctls, thus we
+		 * avoid printing errors
+		 */
+		if (ioctl(fe_fd, FE_READ_SIGNAL_STRENGTH, &signal) == -1)
+			signal = -2;
+		if (ioctl(fe_fd, FE_READ_SNR, &snr) == -1)
+			snr = -2;
+		if (ioctl(fe_fd, FE_READ_BER, &ber) == -1)
+			ber = -2;
+		if (ioctl(fe_fd, FE_READ_UNCORRECTED_BLOCKS, &uncorrected_blocks) == -1)
+			uncorrected_blocks = -2;
+
+		
+			printf ("status %02x | signal %3u%% | snr %3u%% %d | ber %d | unc %d | ",
+				status, (signal * 100) / 0xffff, (snr * 100) / 0xffff, snr, ber, uncorrected_blocks);
+		
+		if (status & FE_HAS_LOCK)
+			printf("FE_HAS_LOCK");
+		printf("\n");
+
+		if ((status & FE_HAS_LOCK) || (++timeout >= 10))
+			break;
+
+		usleep(1000000);
+	} while (1);
+
+	if ((status & FE_HAS_LOCK) == 0)
+		return 0;
+
+	if ((ioctl(fe_fd, FE_GET_PROPERTY, &cmdseq)) == -1) {
+		perror("FE_GET_PROPERTY failed");
+		return 0;
+	}
+	/* printout found parameters here */
+	
+		printf("delivery 0x%x, ", p[0].u.data);
+		printf("modulation 0x%x\n", p[1].u.data);
+		printf("coderate 0x%x, ", p[2].u.data);
+		printf("rolloff 0x%x\n", p[3].u.data);
+		printf("intermediate frequency %d,", p[4].u.data);
+	
+
+	printf("symbol_rate %d\n", p[5].u.data);
+
+	return 0;
 }
 
 static int is_same_frequency(uint32_t f1, uint32_t f2)
@@ -226,7 +358,9 @@ static int is_same_transponder(struct transponder *t1, struct transponder *t2)
 
 static struct transponder *find_transponder_by_freq(uint32_t frequency)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	struct list_head *pos;
+	
 	struct transponder *tp;
 
 	list_for_each(pos, &scanned_transponders) {
@@ -249,7 +383,8 @@ static struct transponder *find_transponder_by_freq(uint32_t frequency)
 }
 
 static struct transponder *find_transponder(uint32_t frequency, enum polarisation pol)
-{
+{fprintf(stderr,"%s\n",__FUNCTION__);
+	
 	struct list_head *pos;
 	struct transponder *tp;
 
@@ -289,6 +424,7 @@ static void remove_duplicate_transponder(struct transponder *t)
 
 static void copy_transponder(struct transponder *d, struct transponder *s, int isOverride)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	d->network_id = s->network_id;
 	d->original_network_id = s->original_network_id;
 	d->transport_stream_id = s->transport_stream_id;
@@ -344,6 +480,7 @@ static void copy_transponder(struct transponder *d, struct transponder *s, int i
 */
 static struct service *alloc_service(struct transponder *tp, int service_id)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	struct service *s = calloc(1, sizeof(*s));
 	INIT_LIST_HEAD(&s->list);
 	s->service_id = service_id;
@@ -353,6 +490,7 @@ static struct service *alloc_service(struct transponder *tp, int service_id)
 
 static struct service *find_service(struct transponder *tp, int service_id)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	struct list_head *pos;
 	struct service *s;
 	list_for_each(pos, &tp->services) {
@@ -982,6 +1120,7 @@ static int find_descriptor(uint8_t tag, const unsigned char *buf,
 						   int descriptors_loop_len,
 						   const unsigned char **desc, int *desc_len)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	while (descriptors_loop_len > 0) {
 		unsigned char descriptor_tag = buf[0];
 		unsigned char descriptor_len = buf[1] + 2;
@@ -1762,6 +1901,8 @@ static void setup_filter (struct section_buf* s, const char *dmx_devname,
 						  enum pid pid, enum table_id tid, int tid_ext,
 						  int run_once, int segmented, int timeout)
 {
+	
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	memset (s, 0, sizeof(struct section_buf));
 
 	s->fd = -1;
@@ -1788,6 +1929,7 @@ static void setup_filter (struct section_buf* s, const char *dmx_devname,
 
 static void update_poll_fds(void)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	struct list_head *p;
 	struct section_buf* s;
 	int i;
@@ -1882,6 +2024,7 @@ static void stop_filter (struct section_buf *s)
 
 static void add_filter (struct section_buf *s)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	verbosedebug("add filter pid 0x%04X\n", s->pid);
 	if (start_filter (s))
 		list_add_tail (&s->list, &waiting_filters);
@@ -1933,6 +2076,7 @@ static void read_filters (void)
 
 static int __tune_to_transponder (int frontend_fd, struct transponder *t)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	int rc;
 	int i;
 	fe_status_t s;
@@ -2076,19 +2220,16 @@ static int __tune_to_transponder (int frontend_fd, struct transponder *t)
 	struct dvb_frontend_event ev;
 	struct dtv_property p_tune[] = {
 		{ .cmd = DTV_DELIVERY_SYSTEM,	.u.data = t->delivery_system },
-		{ .cmd = DTV_FREQUENCY,			.u.data = if_freq },
-		{ .cmd = DTV_MODULATION,		.u.data = t->modulation },
-		{ .cmd = DTV_SYMBOL_RATE,		.u.data = t->symbol_rate },
-		{ .cmd = DTV_INNER_FEC,			.u.data = t->fec },
-		{ .cmd = DTV_INVERSION,			.u.data = t->inversion },
-		{ .cmd = DTV_ROLLOFF,			.u.data = t->rolloff },
-		{ .cmd = DTV_BANDWIDTH_HZ,		.u.data = bandwidth_hz },
-		{ .cmd = DTV_PILOT,			.u.data = PILOT_AUTO },
-		{ .cmd = DTV_STREAM_ID,			.u.data = t->stream_id == NO_STREAM_ID_FILTER ? t->stream_id :
-								  ((t->pls_mode & 0x3) << 26) |
-								  ((t->pls_code & 0x3ffff) << 8) |
-								  (t->stream_id & 0xff)},
+		{ .cmd = DTV_FREQUENCY,		.u.data = if_freq },
+		{ .cmd = DTV_MODULATION,	.u.data = t->modulation },
+		{ .cmd = DTV_SYMBOL_RATE,	.u.data = t->symbol_rate },
+		{ .cmd = DTV_INNER_FEC,		.u.data = t->fec },
+		{ .cmd = DTV_INVERSION,		.u.data = INVERSION_AUTO },
+		{ .cmd = DTV_ROLLOFF,		.u.data = t->rolloff },
+		{ .cmd = DTV_PILOT,		.u.data = PILOT_AUTO },
 		{ .cmd = DTV_TUNE },
+		
+	
 	};
 	struct dtv_properties cmdseq_tune = {
 		.num = sizeof(p_tune)/sizeof(p_tune[0]),
@@ -2111,7 +2252,7 @@ static int __tune_to_transponder (int frontend_fd, struct transponder *t)
 		ioctl(frontend_fd, FE_GET_EVENT, &ev);
 	}
 	while(ev.status != 0);
-
+	verbose(">>> tuning status == 0x%02X\n", ev.status);
 	// Wait for tunning
 	for (i = 0; i < scan_iterations; i++) {
 		usleep (200000);
@@ -2130,7 +2271,7 @@ static int __tune_to_transponder (int frontend_fd, struct transponder *t)
 			/* Remove duplicate entries for the same frequency that were created for other delivery systems */
 			remove_duplicate_transponder(t);
 
-#ifdef READ_PARAMS
+
 			struct dtv_property p[] = {
 				{ .cmd = DTV_DELIVERY_SYSTEM },
 				{ .cmd = DTV_MODULATION },
@@ -2155,7 +2296,7 @@ static int __tune_to_transponder (int frontend_fd, struct transponder *t)
 			t->fec = p[2].u.data;
 			t->inversion = p[3].u.data;
 			t->rolloff = p[4].u.data;
-#endif
+
 			if (ioctl(frontend_fd, FE_READ_STATUS, &s) == -1)
 				perror("FE_READ_STATUS failed");
 			/* some frontends might not support all these ioctls, thus we
@@ -2186,6 +2327,7 @@ static int __tune_to_transponder (int frontend_fd, struct transponder *t)
 
 static int tune_to_transponder (int frontend_fd, struct transponder *t)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	/* move TP from "new" to "scanned" list */
 	list_del_init(&t->list);
 	list_add_tail(&t->list, &scanned_transponders);
@@ -2230,16 +2372,19 @@ static int tune_to_transponder (int frontend_fd, struct transponder *t)
 		t->last_tuning_failed = 1;
 		return -1;
 	}
-
-	if (__tune_to_transponder (frontend_fd, t) == 0)
+	fprintf(stderr,"do_tune(frontend_fd=%d get_ifreq(t->frequency)=%d t->symbol_rate=%d t->delivery_system=%d t->modulation=%d t->fec=%d t->rolloff=%d\n",
+	frontend_fd, get_ifreq(t->frequency), t->symbol_rate, t->delivery_system, t->modulation, t->fec, t->rolloff);
+	if (do_tune(frontend_fd, get_ifreq(t->frequency), t->symbol_rate, t->delivery_system, QPSK, t->fec, t->rolloff) == 0) {
 		return 0;
-
-	return __tune_to_transponder (frontend_fd, t);
+	}
+	check_frontend(frontend_fd);
+	return do_tune(frontend_fd, get_ifreq(t->frequency), t->symbol_rate, t->delivery_system, t->modulation, t->fec, t->rolloff) ;
 }
 
 static int tune_to_next_transponder (int frontend_fd)
 {
-	struct list_head *pos, *tmp;
+	
+	fprintf(stderr,"%s\n",__FUNCTION__);struct list_head *pos, *tmp;
 	struct transponder *t, *to;
 	uint32_t freq;
 	int rc;
@@ -2398,6 +2543,7 @@ static enum fe_bandwidth str2bandwidth(const char *bw)
 
 static const char* bandwidth2str(enum fe_bandwidth bw)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	return enum2str(bw, bwtab, "???");
 }
 
@@ -2537,6 +2683,7 @@ float rotor_angle(int nn) {
 
 static int tune_initial (int frontend_fd, const char *initial)
 {
+	fprintf(stderr,"%s %s\n",__FUNCTION__, initial);
 	FILE *inif;
 	unsigned int f, sr;
 	char buf[1024];
@@ -2569,6 +2716,8 @@ static int tune_initial (int frontend_fd, const char *initial)
 		if (buf[0] == '#' || buf[0] == '\n')
 			;
 		else if (sscanf(buf, "S%c %u %1[HVLR] %u %4s %4s %6s %i %i %i\n", &scan_mode, &f, pol, &sr, fec, rolloff, qam, &stream_id, &pls_code, &pls_mode) >= 3) {
+			fprintf(stderr,"%s %s\n",__FUNCTION__, buf);
+			
 			scan_mode1 = FALSE;
 			scan_mode2 = FALSE;
 			switch(scan_mode)
@@ -2824,6 +2973,7 @@ static void scan_tp_atsc(void)
 
 static void scan_tp_dvb (void)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	struct section_buf s0;
 	struct section_buf s1;
 	struct section_buf s2;
@@ -2838,7 +2988,7 @@ static void scan_tp_dvb (void)
 	add_filter (&s0);
 	add_filter (&s1);
 
-	if (!current_tp_only) {
+	//if (!current_tp_only) {
 		setup_filter (&s2, demux_devname, PID_NIT_ST, TID_NIT_ACTUAL, -1, 1, 0, 15); /* NIT */
 		add_filter (&s2);
 		if (get_other_nits) {
@@ -2849,7 +2999,7 @@ static void scan_tp_dvb (void)
 			setup_filter (&s3, demux_devname, PID_NIT_ST, TID_NIT_OTHER, -1, 1, 1, 15);
 			add_filter (&s3);
 		}
-	}
+	//}
 
 	do {
 		read_filters ();
@@ -2859,6 +3009,7 @@ static void scan_tp_dvb (void)
 
 static void scan_tp(int frontend_fd)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	struct dtv_property p[] = {
 		{ .cmd = DTV_DELIVERY_SYSTEM }
 	};
@@ -2897,7 +3048,7 @@ static void scan_tp(int frontend_fd)
 static void scan_network (int frontend_fd, const char *initial)
 {
 	int rc;
-
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	if (tune_initial (frontend_fd, initial) < 0) {
 		error("initial tuning failed\n");
 		return;
@@ -3099,6 +3250,7 @@ static const char *usage = "\n"
 
 void bad_usage(char *pname, int problem)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	int i;
 	struct lnb_types_st *lnbp;
 	char **cp;
@@ -3132,6 +3284,7 @@ void bad_usage(char *pname, int problem)
 
 int main (int argc, char **argv)
 {
+	fprintf(stderr,"%s\n",__FUNCTION__);
 	char frontend_devname [80];
 	int adapter = 0, frontend = 0, demux = 0;
 	int opt, i;
@@ -3322,10 +3475,10 @@ int main (int argc, char **argv)
 		info("scanning %s\n", initial);
 
 	snprintf (frontend_devname, sizeof(frontend_devname),
-		"/dev/dvb%i.frontend%i", adapter, frontend);
+		DVB_ADAPTER_FORMAT"frontend%i", adapter, frontend);
 
 	snprintf (demux_devname, sizeof(demux_devname),
-		"/dev/dvb%i.demux%i", adapter, demux);
+		DVB_ADAPTER_FORMAT"demux%i", adapter, demux);
 	info("using '%s' and '%s'\n", frontend_devname, demux_devname);
 
 	
